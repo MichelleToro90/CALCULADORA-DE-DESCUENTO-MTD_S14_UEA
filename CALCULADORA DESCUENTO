@@ -1,0 +1,253 @@
+import sqlite3
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from datetime import datetime
+
+DB_PATH = "facturas.db"
+TWO = Decimal("0.01")
+
+
+# ========= Utilidades de dinero =========
+def to_decimal(txt: str, minimo: Decimal | None = None) -> Decimal:
+    """Convierte texto a Decimal con 2 decimales. Acepta coma o punto."""
+    txt = (txt or "").strip().replace(",", ".")
+    try:
+        val = Decimal(txt).quantize(TWO, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        raise ValueError("Valor numérico inválido.")
+    if minimo is not None and val < minimo:
+        raise ValueError(f"El valor debe ser >= {minimo}.")
+    return val
+
+
+def calcular_descuento(monto_total: Decimal, porcentaje_descuento: Decimal = Decimal("10")) -> Decimal:
+    """Devuelve el monto de descuento (redondeado a 2 decimales)."""
+    return (monto_total * (porcentaje_descuento / Decimal("100"))).quantize(TWO, rounding=ROUND_HALF_UP)
+
+
+# ========= Base de datos =========
+def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            phone TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            discount_pct REAL NOT NULL,
+            iva_pct REAL NOT NULL,
+            subtotal TEXT NOT NULL,
+            discount TEXT NOT NULL,
+            taxable_base TEXT NOT NULL,
+            iva TEXT NOT NULL,
+            total TEXT NOT NULL,
+            FOREIGN KEY(client_id) REFERENCES clients(id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER NOT NULL,
+            code TEXT,
+            description TEXT,
+            unit_price TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            line_total TEXT NOT NULL,
+            FOREIGN KEY(invoice_id) REFERENCES invoices(id)
+        )
+    """)
+    con.commit()
+    return con
+
+
+def get_or_create_client(con: sqlite3.Connection, name: str, phone: str) -> int:
+    cur = con.cursor()
+    # Normalizamos el nombre
+    name_norm = " ".join(w.capitalize() for w in name.strip().split())
+    cur.execute("SELECT id FROM clients WHERE name = ?", (name_norm,))
+    row = cur.fetchone()
+    if row:
+        # Si ya existe, actualizamos el teléfono por si cambió
+        cur.execute("UPDATE clients SET phone = ? WHERE id = ?", (phone.strip(), row[0]))
+        con.commit()
+        return row[0]
+    cur.execute("INSERT INTO clients(name, phone) VALUES (?, ?)", (name_norm, phone.strip()))
+    con.commit()
+    return cur.lastrowid
+
+
+def insert_invoice(con: sqlite3.Connection, client_id: int, discount_pct: Decimal, iva_pct: Decimal,
+                   subtotal: Decimal, discount: Decimal, base: Decimal, iva: Decimal, total: Decimal) -> int:
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO invoices(client_id, date, discount_pct, iva_pct, subtotal, discount, taxable_base, iva, total)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        client_id,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        float(discount_pct),
+        float(iva_pct),
+        str(subtotal),
+        str(discount),
+        str(base),
+        str(iva),
+        str(total),
+    ))
+    con.commit()
+    return cur.lastrowid
+
+
+def insert_item(con: sqlite3.Connection, invoice_id: int, code: str, description: str,
+                unit_price: Decimal, quantity: int, line_total: Decimal) -> int:
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO items(invoice_id, code, description, unit_price, quantity, line_total)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        invoice_id,
+        code,
+        description,
+        str(unit_price),
+        int(quantity),
+        str(line_total),
+    ))
+    con.commit()
+    return cur.lastrowid
+
+
+# ========= Cálculos =========
+def calcular_totales(items: list[dict], porcentaje_iva: Decimal, porcentaje_descuento: Decimal) -> dict:
+    subtotal = sum((it["precio"] * it["cantidad"] for it in items), Decimal("0")).quantize(TWO, rounding=ROUND_HALF_UP)
+    descuento = calcular_descuento(subtotal, porcentaje_descuento)
+    base = (subtotal - descuento).quantize(TWO, rounding=ROUND_HALF_UP)
+    iva = (base * (porcentaje_iva / Decimal("100"))).quantize(TWO, rounding=ROUND_HALF_UP)
+    total = (base + iva).quantize(TWO, rounding=ROUND_HALF_UP)
+    return {"subtotal": subtotal, "descuento": descuento, "base": base, "iva": iva, "total": total}
+
+
+# ========= Entrada interactiva =========
+def input_no_vacio(msg: str) -> str:
+    while True:
+        val = input(msg).strip()
+        if val:
+            return val
+        print("⚠ Ingrese un valor no vacío.")
+
+
+def input_decimal(msg: str, minimo: Decimal | None = None, default: Decimal | None = None) -> Decimal:
+    while True:
+        raw = input(msg).strip()
+        if not raw and default is not None:
+            return default
+        try:
+            return to_decimal(raw, minimo=minimo)
+        except ValueError as e:
+            print(f"⚠ {e}")
+
+
+def input_entero_rango(msg: str, minimo: int, maximo: int) -> int:
+    while True:
+        raw = input(msg).strip()
+        if raw.isdigit():
+            val = int(raw)
+            if minimo <= val <= maximo:
+                return val
+        print(f"⚠ Ingrese un entero entre {minimo} y {maximo}.")
+
+
+def capturar_items(max_items: int = 9) -> list[dict]:
+    n = input_entero_rango(f"¿Cuántos productos desea agregar? (1-{max_items}): ", 1, max_items)
+    items: list[dict] = []
+    for i in range(1, n + 1):
+        print(f"\n--- Producto {i} ---")
+        codigo = input_no_vacio("Código: ")
+        descripcion = input_no_vacio("Descripción: ")
+        precio = input_decimal("Precio unitario: ", minimo=Decimal("0.00"))
+        cantidad = input_entero_rango("Cantidad: ", 1, 10**6)
+        items.append({"codigo": codigo, "descripcion": descripcion, "precio": precio, "cantidad": cantidad})
+    return items
+
+
+def imprimir_factura_en_consola(cliente: dict, items: list[dict], p_desc: Decimal, p_iva: Decimal, tot: dict):
+    print("\n" + "=" * 74)
+    print(" " * 26 + "FACTURA (DEMO / BD)")
+    print("=" * 74)
+    print(f"Cliente : {cliente['name']}")
+    print(f"Celular : {cliente['phone']}")
+    print("-" * 74)
+    print(f"{'CÓD':<8} {'DESCRIPCIÓN':<36} {'CANT':>5} {'P.U.':>10} {'TOTAL':>12}")
+    print("-" * 74)
+    for it in items:
+        linea = (it["precio"] * it["cantidad"]).quantize(TWO, rounding=ROUND_HALF_UP)
+        print(f"{it['codigo']:<8} {it['descripcion']:<36} {it['cantidad']:>5} {it['precio']:>10} {linea:>12}")
+    print("-" * 74)
+    print(f"{'SUBTOTAL:':>61} {tot['subtotal']:>12}")
+    print(f"{f'DESCUENTO ({p_desc}%):':>61} {tot['descuento']:>12}")
+    print(f"{'BASE IMPONIBLE:':>61} {tot['base']:>12}")
+    print(f"{f'IVA ({p_iva}%):':>61} {tot['iva']:>12}")
+    print(f"{'TOTAL:':>61} {tot['total']:>12}")
+    print("=" * 74)
+
+
+# ========= Flujo principal =========
+def main():
+    print("=== Sistema de Facturación con Base de Datos (SQLite) ===")
+    con = init_db(DB_PATH)
+
+    # Cliente
+    nombre = input_no_vacio("Nombre del cliente: ")
+    celular = input_no_vacio("Número de celular: ")
+    client_id = get_or_create_client(con, nombre, celular)
+    cliente = {"id": client_id, "name": " ".join(w.capitalize() for w in nombre.strip().split()), "phone": celular.strip()}
+
+    # Items
+    items = capturar_items(max_items=9)
+
+    # Porcentajes
+    p_desc = input_decimal("Porcentaje de DESCUENTO (ENTER para 10%): ", minimo=Decimal("0"), default=Decimal("10"))
+    p_iva = input_decimal("Porcentaje de IVA (ENTER para 12%): ", minimo=Decimal("0"), default=Decimal("12"))
+
+    # Totales
+    tot = calcular_totales(items, porcentaje_iva=p_iva, porcentaje_descuento=p_desc)
+
+    # Guardar factura
+    invoice_id = insert_invoice(
+        con,
+        client_id=client_id,
+        discount_pct=p_desc,
+        iva_pct=p_iva,
+        subtotal=tot["subtotal"],
+        discount=tot["descuento"],
+        base=tot["base"],
+        iva=tot["iva"],
+        total=tot["total"],
+    )
+
+    # Guardar items
+    for it in items:
+        line_total = (it["precio"] * it["cantidad"]).quantize(TWO, rounding=ROUND_HALF_UP)
+        insert_item(
+            con,
+            invoice_id=invoice_id,
+            code=it["codigo"],
+            description=it["descripcion"],
+            unit_price=it["precio"],
+            quantity=it["cantidad"],
+            line_total=line_total,
+        )
+
+    # Mostrar resumen al usuario
+    imprimir_factura_en_consola(cliente, items, p_desc, p_iva, tot)
+    print(f"\n✔ Factura guardada en la base de datos '{DB_PATH}' con ID: {invoice_id}\n")
+
+    con.close()
+
+
+if __name__ == "__main__":
+    main()
